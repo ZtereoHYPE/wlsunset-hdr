@@ -4,6 +4,8 @@
 #include <math.h>
 #include <errno.h>
 #include <time.h>
+#include <stdint.h>
+#include "color-management-v1-client-protocol.h"
 #include "color.h"
 
 static int days_in_year(int year) {
@@ -150,25 +152,6 @@ static int planckian_locus(int temp, double *x, double *y) {
 	return 0;
 }
 
-static double clamp(double value) {
-	if (value > 1.0) {
-		return 1.0;
-	} else if (value < 0.0) {
-		return 0.0;
-	} else {
-		return value;
-	}
-}
-
-static struct rgb xyz_to_rgb(const struct xyz *xyz) {
-	// http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
-	return (struct rgb) {
-		.r = pow(clamp(3.2404542 * xyz->x - 1.5371385 * xyz->y - 0.4985314 * xyz->z), 1.0 / 2.2),
-		.g = pow(clamp(-0.9692660 * xyz->x + 1.8760108 * xyz->y + 0.0415560 * xyz->z), 1.0 / 2.2),
-		.b = pow(clamp(0.0556434 * xyz->x - 0.2040259 * xyz->y + 1.0572252 * xyz->z), 1.0 / 2.2)
-	};
-}
-
 static void rgb_normalize(struct rgb *rgb) {
 	double maxw = fmax(rgb->r, fmax(rgb->g, rgb->b));
 	rgb->r /= maxw;
@@ -176,7 +159,92 @@ static void rgb_normalize(struct rgb *rgb) {
 	rgb->b /= maxw;
 }
 
-struct rgb calc_whitepoint(int temp) {
+// http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+static double srgb_primaries[] = {
+	3.2404542, -1.5371385, -0.4985314, 
+	-0.9692660, 1.8760108, 0.0415560, 
+	0.0556434, -0.2040259, 1.0572252
+};
+
+static double bt_2020_primaries[] = {
+	1.7166512, -0.3556708, -0.2533663,
+	-0.6666844, 1.6164812,  0.0157685,
+	0.0176399, -0.0427706, 0.9421031
+};
+
+static struct rgb apply_primaries(struct xyz wp, uint32_t primaries_enum) {
+	double *matrix;
+	
+	switch (primaries_enum) {
+	case WP_COLOR_MANAGER_V1_PRIMARIES_BT2020:
+		matrix = bt_2020_primaries;
+		break;
+
+	default:
+		matrix = srgb_primaries;
+	};
+
+	return (struct rgb) {
+		.r = matrix[0] * wp.x + matrix[1] * wp.y + matrix[2] * wp.z,
+		.g = matrix[3] * wp.x + matrix[4] * wp.y + matrix[5] * wp.z,
+		.b = matrix[6] * wp.x + matrix[7] * wp.y + matrix[8] * wp.z
+	};
+}
+
+static double st2084_pq(double value) {
+	// ST 2084 PQ (Perceptual Quantizer) inverse EOTF
+	// https://en.wikipedia.org/wiki/Perceptual_quantizer#Technical_details
+	const double m1 = 0.1593017578125;
+	const double m2 = 78.84375;
+	const double c1 = 0.8359375;
+	const double c2 = 18.8515625;
+	const double c3 = 18.6875;
+	
+	if (value <= 0.0) {
+		return 0.0;
+	}
+	
+	double v = pow(value / 10000.0, m1);
+	double num = c1 + c2 * v;
+	double denom = 1.0 + c3 * v;
+	
+	return pow(num / denom, m2);
+}
+
+static void pq_tf(struct rgb *wp) {
+	// The PQ transfer function expects absolute brightness values.
+	// According to the wayland color management protocol, the 
+	// reference white point is at 203 cd/m².
+	const double brightness = 203.0;
+
+	// Get our white point hue for this absolute brightness
+	wp->r = st2084_pq(wp->r * brightness);
+	wp->g = st2084_pq(wp->g * brightness);
+	wp->b = st2084_pq(wp->b * brightness);
+
+	// Since the st2084_pq transfer function will reduce the intensity 
+	// of the white point to 203 lumen, normalize it back.
+	rgb_normalize(wp);
+}
+
+static void gamma22_tf(struct rgb *wp) {
+	wp->r = pow(wp->r, 1.0 / 2.2);
+	wp->g = pow(wp->g, 1.0 / 2.2);
+	wp->b = pow(wp->b, 1.0 / 2.2);
+}
+
+static void apply_transfer_function(struct rgb *wp, uint32_t transfer_function_enum) {
+	switch (transfer_function_enum) {
+	case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ:
+		pq_tf(wp);
+		break;
+
+	default:
+		gamma22_tf(wp);
+	}
+}
+
+struct rgb calc_whitepoint(int temp, uint32_t primaries_enum, uint32_t transfer_function_enum) {
 	if (temp == 6500) {
 		return (struct rgb) {.r = 1.0, .g = 1.0, .b = 1.0};
 	}
@@ -210,9 +278,9 @@ struct rgb calc_whitepoint(int temp) {
 	}
 	wp.z = 1.0 - wp.x - wp.y;
 
-	struct rgb wp_rgb = xyz_to_rgb(&wp);
+	struct rgb wp_rgb = apply_primaries(wp, primaries_enum);
 	rgb_normalize(&wp_rgb);
+	apply_transfer_function(&wp_rgb, transfer_function_enum);
 
 	return wp_rgb;
 }
-

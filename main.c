@@ -17,6 +17,7 @@
 #include <wayland-client.h>
 
 #include "wlr-gamma-control-unstable-v1-client-protocol.h"
+#include "color-management-v1-client-protocol.h"
 #include "color.h"
 #include "str_vec.h"
 
@@ -140,13 +141,14 @@ struct context {
 	time_t night_step_time;
 	time_t calc_day;
 
-	bool new_output;
+	bool outputs_changed;
 	struct wl_list outputs;
 	timer_t timer;
 
 	enum force_state forced_state;
 
 	struct zwlr_gamma_control_manager_v1 *gamma_control_manager;
+	struct wp_color_manager_v1 *color_manager;
 };
 
 struct output {
@@ -155,7 +157,10 @@ struct output {
 	struct context *context;
 	struct wl_output *wl_output;
 	struct zwlr_gamma_control_v1 *gamma_control;
+	struct wp_image_description_v1 *image_description;
 
+	uint32_t transfer_function;
+	uint32_t primaries;
 	int table_fd;
 	uint32_t id;
 	uint32_t ramp_size;
@@ -460,7 +465,7 @@ static void gamma_control_handle_gamma_size(void *data,
 		return;
 	}
 	output->table_fd = create_gamma_table(ramp_size, &output->table);
-	output->context->new_output = true;
+	output->context->outputs_changed = true;
 	if (output->table_fd < 0) {
 		fprintf(stderr, "could not create gamma table for output %s (%d)\n",
 				output->name, output->id);
@@ -502,6 +507,175 @@ static void setup_gamma_control(struct context *ctx, struct output *output) {
 		&gamma_control_listener, output);
 }
 
+static void image_description_handle_tf_named(void *data, 
+		struct wp_image_description_info_v1 *wp_image_description_info_v1,
+		uint32_t tf) {
+	(void)wp_image_description_info_v1;
+	struct output *output = data;
+	output->transfer_function = tf;
+}
+
+static void image_description_handle_tf_power(void *data,
+		struct wp_image_description_info_v1 *wp_image_description_info_v1,
+		uint32_t eexp) {
+	(void)data, (void)wp_image_description_info_v1, (void)eexp;
+}
+
+static void image_description_handle_primaries_named(void *data,
+		struct wp_image_description_info_v1 *wp_image_description_info_v1,
+		uint32_t primaries) {
+	(void)wp_image_description_info_v1;
+	struct output *output = data;
+	output->primaries = primaries;
+}
+
+static void image_description_handle_done(void *data,
+		struct wp_image_description_info_v1 *wp_image_description_info_v1) {
+	(void)wp_image_description_info_v1;
+	struct output *output = data;
+	// Set the temperature again using the new values
+	output->context->outputs_changed = true;
+}
+
+static void image_description_handle_icc_file(void *data,
+		struct wp_image_description_info_v1 *wp_image_description_info_v1, 
+		int32_t icc, uint32_t icc_size) {
+	(void)data, (void)wp_image_description_info_v1, (void)icc, (void)icc_size;
+}
+
+static void image_description_handle_primaries(void *data,
+		struct wp_image_description_info_v1 *wp_image_description_info_v1,
+		int32_t r_x, int32_t r_y, int32_t g_x, int32_t g_y, int32_t b_x,
+		int32_t b_y, int32_t w_x, int32_t w_y) {
+	(void)data, (void)wp_image_description_info_v1, (void)r_x, (void)r_y, (void)g_x,
+		(void)g_y, (void)b_x, (void)b_y, (void)w_x, (void)w_y;
+}
+
+static void image_description_handle_luminances(void *data, 
+		struct wp_image_description_info_v1 *wp_image_description_info_v1, 
+		uint32_t min_lum, uint32_t max_lum, uint32_t reference_lum) {
+	(void)data, (void)wp_image_description_info_v1, (void)min_lum, (void)max_lum,
+		(void)reference_lum;
+}
+
+static void image_description_handle_target_primaries(void *data, 
+		struct wp_image_description_info_v1 *wp_image_description_info_v1,
+		int32_t r_x, int32_t r_y, int32_t g_x, int32_t g_y, int32_t b_x, 
+		int32_t b_y, int32_t w_x, int32_t w_y) {
+	(void)data, (void)wp_image_description_info_v1, (void)r_x, (void)r_y, (void)g_x,
+		(void)g_y, (void)b_x, (void)b_y, (void)w_x, (void)w_y;
+}
+
+static void image_description_handle_target_luminance(void *data, 
+		struct wp_image_description_info_v1 *wp_image_description_info_v1, 
+		uint32_t min_lum, uint32_t max_lum) {
+	(void)data, (void)wp_image_description_info_v1, (void)min_lum, (void)max_lum;
+}
+
+static void image_description_handle_target_max_cll(void *data, 
+		struct wp_image_description_info_v1 *wp_image_description_info_v1,
+		uint32_t max_cll) {
+	(void)data, (void)wp_image_description_info_v1, (void)max_cll;
+}
+
+static void image_description_handle_target_max_fall(void *data, 
+		struct wp_image_description_info_v1 *wp_image_description_info_v1, 
+		uint32_t max_fall) {
+	(void)data, (void)wp_image_description_info_v1, (void)max_fall;
+}
+
+static const struct wp_image_description_info_v1_listener image_description_info_listener = {
+	.tf_power = image_description_handle_tf_power,
+	.primaries_named = image_description_handle_primaries_named,
+	.done = image_description_handle_done,
+	.icc_file = image_description_handle_icc_file,
+	.primaries = image_description_handle_primaries,
+	.tf_named = image_description_handle_tf_named,
+	.luminances = image_description_handle_luminances,
+	.target_primaries = image_description_handle_target_primaries,
+	.target_luminance = image_description_handle_target_luminance,
+	.target_max_cll = image_description_handle_target_max_cll,
+	.target_max_fall = image_description_handle_target_max_fall,
+};
+
+static void image_description_handle_failed(void *data, struct wp_image_description_v1 *wp_image_description_v1, uint32_t cause, const char *msg) {
+	(void)wp_image_description_v1, (void)cause, (void)msg;
+	struct output *output = data;
+	output->context->outputs_changed = true;
+}
+
+static void get_image_description_color_info(struct output *output, struct wp_image_description_v1 *image_description) {
+	struct wp_image_description_info_v1 *color_info = 
+		wp_image_description_v1_get_information(image_description);
+
+	wp_image_description_info_v1_add_listener(color_info, &image_description_info_listener, 
+			output);
+}
+
+static void image_description_handle_ready(void *data, 
+		struct wp_image_description_v1 *wp_image_description_v1, uint32_t identity) {
+	(void)identity;
+	struct output *output = data;
+	get_image_description_color_info(output, wp_image_description_v1);
+}
+
+static void image_description_handle_ready2(void *data, 
+		struct wp_image_description_v1 *wp_image_description_v1, uint32_t identity_hi, uint32_t identity_lo) {
+	(void)wp_image_description_v1, (void)identity_hi, (void)identity_lo;
+	struct output *output = data;
+	get_image_description_color_info(output, wp_image_description_v1);
+}
+
+static const struct wp_image_description_v1_listener image_description_listener = {
+	.failed = image_description_handle_failed,
+	.ready = image_description_handle_ready,
+	.ready2 = image_description_handle_ready2,
+};
+
+static void color_output_handle_image_description_changed(void *data,
+		struct wp_color_management_output_v1 *wp_color_management_output_v1) {
+	// Get the new image description information, and destroy it right after
+	struct output *output = data;
+
+	struct wp_image_description_v1 *new_image_description = 
+		wp_color_management_output_v1_get_image_description(wp_color_management_output_v1);
+
+	// According to the spec, the same image description object will always produce 
+	// the same image description info. Therefore, nothing would change in this case.
+	if (output->image_description == new_image_description) {
+		return;
+	}
+
+	// Destroy the old image description, if any.
+	if (output->image_description != NULL) {
+		wp_image_description_v1_destroy(output->image_description);
+	}
+
+	output->image_description = new_image_description;
+
+	wp_image_description_v1_add_listener(output->image_description, &image_description_listener, output);
+}
+
+static const struct wp_color_management_output_v1_listener color_output_listener = {
+	.image_description_changed = color_output_handle_image_description_changed,
+};
+
+static void add_color_manager_output_listener(struct context *ctx, struct output *output) {
+	if (ctx->color_manager == NULL) {
+		fprintf(stderr, "skipping color setup of output %s (%d): color_manager missing\n",
+				output->name, output->id);
+		return;
+	}
+
+	struct wp_color_management_output_v1 *color_management =
+		wp_color_manager_v1_get_output(ctx->color_manager, output->wl_output);
+
+	wp_color_management_output_v1_add_listener(color_management, &color_output_listener, &output);
+
+	// Invoke the callback manually the first time
+	color_output_handle_image_description_changed((void *)output, color_management);
+}
+
 static void wl_output_handle_geometry(void *data, struct wl_output *output, int x, int y, int width,
 				      int height, int subpixel, const char *make, const char *model,
 				      int transform) {
@@ -519,6 +693,9 @@ static void wl_output_handle_done(void *data, struct wl_output *wl_output) {
 	struct output *output = data;
 	if (output->enabled) {
 		setup_gamma_control(output->context, output);
+		if (output->context->color_manager != NULL) {
+			add_color_manager_output_listener(output->context, output);
+		}
 	}
 }
 
@@ -573,6 +750,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 		output->id = name;
 		output->table_fd = -1;
 		output->context = ctx;
+		output->transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22;
+		output->primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
+		output->image_description = NULL;
 
 		if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
 			output->enabled = ctx->config.output_names.len == 0;
@@ -586,6 +766,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 			output->wl_output = wl_registry_bind(registry, name,
 					&wl_output_interface, version);
 			setup_gamma_control(ctx, output);
+			if (output->context->color_manager != NULL) {
+				add_color_manager_output_listener(output->context, output);
+			}
 		}
 
 		wl_list_insert(&ctx->outputs, &output->link);
@@ -593,6 +776,10 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 				zwlr_gamma_control_manager_v1_interface.name) == 0) {
 		ctx->gamma_control_manager = wl_registry_bind(registry, name,
 				&zwlr_gamma_control_manager_v1_interface, 1);
+	} else if (strcmp(interface, wp_color_manager_v1_interface.name) == 0) {
+		fprintf(stderr, "registry: adding color manager %d\n", name);
+		ctx->color_manager = wl_registry_bind(registry, name, 
+				&wp_color_manager_v1_interface, version);
 	}
 }
 
@@ -647,10 +834,9 @@ static void output_set_whitepoint(struct output *output, struct rgb *wp, double 
 }
 
 static void set_temperature(struct wl_list *outputs, int temp, double gamma) {
-	struct rgb wp = calc_whitepoint(temp);
 	struct output *output;
 	fprintf(stderr, "setting temperature to %d K\n", temp);
-
+	
 	wl_list_for_each(output, outputs, link) {
 		if (!output->enabled) {
 			continue;
@@ -659,6 +845,8 @@ static void set_temperature(struct wl_list *outputs, int temp, double gamma) {
 			setup_gamma_control(output->context, output);
 			continue;
 		}
+
+		struct rgb wp = calc_whitepoint(temp, output->primaries, output->transfer_function);
 		output_set_whitepoint(output, &wp, gamma);
 	}
 }
@@ -841,8 +1029,8 @@ static int wlrun(struct config cfg) {
 
 	double old_pos = pos;
 	while (display_dispatch(display, -1) != -1) {
-		if (ctx.new_output) {
-			ctx.new_output = false;
+		if (ctx.outputs_changed) {
+			ctx.outputs_changed = false;
 
 			// Force set_temperature
 			old_pos = -1.0;
@@ -882,7 +1070,7 @@ static int wlrun(struct config cfg) {
 			pos = get_position(&ctx, now);
 			if (pos != old_pos) {
 				old_pos = pos;
-				ctx.new_output = false;
+				ctx.outputs_changed = false;
 
 				set_temperature(&ctx.outputs, get_temp_from_pos(&ctx, pos),
 						ctx.config.gamma);
