@@ -5,7 +5,7 @@
 #include <errno.h>
 #include <time.h>
 #include <stdint.h>
-#include "color-management-v1-client-protocol.h"
+#include <wayland-protocols/color-management-v1-enum.h>
 #include "color.h"
 
 static int days_in_year(int year) {

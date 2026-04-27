@@ -35,18 +35,20 @@ scanner = find_program('wayland-scanner')
 scanner_private_code = generator(scanner, output: '@BASENAME@-protocol.c', arguments: ['private-code', '@INPUT@', '@OUTPUT@'])
 scanner_client_header = generator(scanner, output: '@BASENAME@-client-protocol.h', arguments: ['client-header', '@INPUT@', '@OUTPUT@'])
 
+wl_client = dependency('wayland-client')
+wl_protocols = dependency('wayland-protocols')
+wl_protocols_dir = wl_protocols.get_variable(pkgconfig: 'pkgdatadir')
+
 protocols_src = [
-	scanner_private_code.process('wlr-gamma-control-unstable-v1.xml'), 
-	scanner_private_code.process('color-management-v1.xml')
+	scanner_private_code.process('wlr-gamma-control-unstable-v1.xml'),
+	scanner_private_code.process(wl_protocols_dir / 'staging/color-management/color-management-v1.xml'),
 ]
 
 protocols_headers = [
 	scanner_client_header.process('wlr-gamma-control-unstable-v1.xml'),
-	scanner_client_header.process('color-management-v1.xml')
+	scanner_client_header.process(wl_protocols_dir / 'staging/color-management/color-management-v1.xml'),
 ]
 
-wl_client = dependency('wayland-client')
-wl_protocols = dependency('wayland-protocols')
 lib_protocols = static_library('protocols', protocols_src + protocols_headers, dependencies: wl_client)
 protocols_dep = declare_dependency(link_with: lib_protocols, sources: protocols_headers)
 
