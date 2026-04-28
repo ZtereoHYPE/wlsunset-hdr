@@ -157,6 +157,7 @@ struct output {
 	struct context *context;
 	struct wl_output *wl_output;
 	struct zwlr_gamma_control_v1 *gamma_control;
+	struct wp_color_management_output_v1 *color_management_output;
 	struct wp_image_description_v1 *image_description;
 
 	uint32_t transfer_function;
@@ -634,7 +635,6 @@ static const struct wp_image_description_v1_listener image_description_listener 
 
 static void color_output_handle_image_description_changed(void *data,
 		struct wp_color_management_output_v1 *wp_color_management_output_v1) {
-	// Get the new image description information, and destroy it right after
 	struct output *output = data;
 
 	struct wp_image_description_v1 *new_image_description = 
@@ -651,6 +651,10 @@ static void color_output_handle_image_description_changed(void *data,
 		wp_image_description_v1_destroy(output->image_description);
 	}
 
+	// Reset the values to default fallback.
+	output->transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22;
+	output->primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
+
 	output->image_description = new_image_description;
 
 	wp_image_description_v1_add_listener(output->image_description, &image_description_listener, output);
@@ -660,20 +664,24 @@ static const struct wp_color_management_output_v1_listener color_output_listener
 	.image_description_changed = color_output_handle_image_description_changed,
 };
 
-static void add_color_manager_output_listener(struct context *ctx, struct output *output) {
+static void setup_color_management(struct context *ctx, struct output *output) {
+	if (output->color_management_output != NULL) {
+		return;
+	}
 	if (ctx->color_manager == NULL) {
 		fprintf(stderr, "skipping color setup of output %s (%d): color_manager missing\n",
 				output->name, output->id);
 		return;
 	}
 
-	struct wp_color_management_output_v1 *color_management =
+	output->color_management_output =
 		wp_color_manager_v1_get_output(ctx->color_manager, output->wl_output);
 
-	wp_color_management_output_v1_add_listener(color_management, &color_output_listener, &output);
+	wp_color_management_output_v1_add_listener(output->color_management_output, 
+		&color_output_listener, output);
 
-	// Invoke the callback manually the first time
-	color_output_handle_image_description_changed((void *)output, color_management);
+	// Manually query the image description the first time
+	color_output_handle_image_description_changed((void *)output, output->color_management_output);
 }
 
 static void wl_output_handle_geometry(void *data, struct wl_output *output, int x, int y, int width,
@@ -694,7 +702,7 @@ static void wl_output_handle_done(void *data, struct wl_output *wl_output) {
 	if (output->enabled) {
 		setup_gamma_control(output->context, output);
 		if (output->context->color_manager != NULL) {
-			add_color_manager_output_listener(output->context, output);
+			setup_color_management(output->context, output);
 		}
 	}
 }
@@ -753,6 +761,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 		output->transfer_function = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22;
 		output->primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
 		output->image_description = NULL;
+		output->color_management_output = NULL;
 
 		if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
 			output->enabled = ctx->config.output_names.len == 0;
@@ -767,7 +776,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 					&wl_output_interface, version);
 			setup_gamma_control(ctx, output);
 			if (output->context->color_manager != NULL) {
-				add_color_manager_output_listener(output->context, output);
+				setup_color_management(output->context, output);
 			}
 		}
 
