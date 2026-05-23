@@ -4,6 +4,8 @@
 #include <math.h>
 #include <errno.h>
 #include <time.h>
+#include <stdint.h>
+#include <wayland-protocols/color-management-v1-enum.h>
 #include "color.h"
 
 static int days_in_year(int year) {
@@ -150,25 +152,6 @@ static int planckian_locus(int temp, double *x, double *y) {
 	return 0;
 }
 
-static double clamp(double value) {
-	if (value > 1.0) {
-		return 1.0;
-	} else if (value < 0.0) {
-		return 0.0;
-	} else {
-		return value;
-	}
-}
-
-static struct rgb xyz_to_rgb(const struct xyz *xyz) {
-	// http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
-	return (struct rgb) {
-		.r = pow(clamp(3.2404542 * xyz->x - 1.5371385 * xyz->y - 0.4985314 * xyz->z), 1.0 / 2.2),
-		.g = pow(clamp(-0.9692660 * xyz->x + 1.8760108 * xyz->y + 0.0415560 * xyz->z), 1.0 / 2.2),
-		.b = pow(clamp(0.0556434 * xyz->x - 0.2040259 * xyz->y + 1.0572252 * xyz->z), 1.0 / 2.2)
-	};
-}
-
 static void rgb_normalize(struct rgb *rgb) {
 	double maxw = fmax(rgb->r, fmax(rgb->g, rgb->b));
 	rgb->r /= maxw;
@@ -176,11 +159,69 @@ static void rgb_normalize(struct rgb *rgb) {
 	rgb->b /= maxw;
 }
 
-struct rgb calc_whitepoint(int temp) {
-	if (temp == 6500) {
-		return (struct rgb) {.r = 1.0, .g = 1.0, .b = 1.0};
+// http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+static double srgb_primaries[] = {
+	3.2404542, -1.5371385, -0.4985314,
+	-0.9692660, 1.8760108, 0.0415560,
+	0.0556434, -0.2040259, 1.0572252
+};
+
+// TODO: make sure this is post-transformation...? uh oh... the top one is already in srgb mind you
+static double bt_2020_primaries[] = {
+	1.7166512, -0.3556708, -0.2533663,
+	-0.6666844, 1.6164812,  0.0157685,
+	0.0176399, -0.0427706, 0.9421031
+};
+
+static double pq_tf(double value) {
+	// ST 2084 PQ (Perceptual Quantizer) EOTF, modified to use brightness in range 0..1
+	// https://en.wikipedia.org/wiki/Perceptual_quantizer#Technical_details
+	const double m1 = 0.1593017578125;
+	const double m2 = 78.84375;
+	const double c1 = 0.8359375;
+	const double c2 = 18.8515625;
+	const double c3 = 18.6875;
+
+	if (value <= 0.0) {
+		return 0.0;
 	}
 
+	double v = pow(value, 1.0 / m2);
+	double num = fmax(v - c1, 0.0);
+	double denom = c2 - c3 * v;
+	
+	return pow(num / denom, 1.0 / m1);
+}
+
+static double pq_inverse_tf(double value) {
+	// ST 2084 PQ (Perceptual Quantizer) inverse EOTF, modified to use brightness in range 0..1
+	const double m1 = 0.1593017578125;
+	const double m2 = 78.84375;
+	const double c1 = 0.8359375;
+	const double c2 = 18.8515625;
+	const double c3 = 18.6875;
+
+	if (value <= 0.0) {
+		return 0.0;
+	}
+
+	double v = pow(value, m1);
+	double num = c1 + c2 * v;
+	double denom = 1.0 + c3 * v;
+
+	return pow(num / denom, m2);
+}
+
+static double gamma22_tf(double value) {
+    return pow(value, 2.2);
+}
+
+// linear to sRGB
+static double gamma22_inverse_tf(double value) {
+    return pow(value, 1.0 / 2.2);
+}
+
+struct xyz calc_whitepoint_xyz(int temp) {
 	// We are not trying to calculate the accurate whitepoint, but rather
 	// an expected observed whitepoint. We generally expect dim and warm
 	// light sources to follow the planckian locus, while we expect bright
@@ -209,10 +250,54 @@ struct rgb calc_whitepoint(int temp) {
 		planckian_locus(temp >= 1667 ? temp : 1667, &wp.x, &wp.y);
 	}
 	wp.z = 1.0 - wp.x - wp.y;
-
-	struct rgb wp_rgb = xyz_to_rgb(&wp);
-	rgb_normalize(&wp_rgb);
-
-	return wp_rgb;
+	return wp;
 }
 
+struct rgb calc_whitepoint_linear(struct xyz wp, uint32_t primaries) {
+	double *matrix;
+	switch (primaries) {
+	case WP_COLOR_MANAGER_V1_PRIMARIES_BT2020:
+		matrix = bt_2020_primaries;
+		break;
+	default:
+		matrix = srgb_primaries;
+	};
+
+	struct rgb linear_wp = {
+		.r = matrix[0] * wp.x + matrix[1] * wp.y + matrix[2] * wp.z,
+		.g = matrix[3] * wp.x + matrix[4] * wp.y + matrix[5] * wp.z,
+		.b = matrix[6] * wp.x + matrix[7] * wp.y + matrix[8] * wp.z
+	};
+	rgb_normalize(&linear_wp);
+	return linear_wp;
+}
+
+struct rgb calc_gamma_value(struct rgb wp, double val, uint32_t transfer_function) {
+	// Get the appropriate transfer function (and inverse)
+	double (*inverse_tf)(double);
+	double (*tf)(double);
+	switch (transfer_function) {
+	case WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ:
+		inverse_tf = &pq_inverse_tf;
+		tf = &pq_tf;
+		break;
+	default:
+		inverse_tf = &gamma22_inverse_tf;
+		tf = &gamma22_tf;
+	}
+
+	// The value being passed through the GAMMA_LUT is no longer
+	// in linear color space, so we must first obtain the linear
+	// value before applying the white point and finally mapping 
+	// it back to the non-linear color space.
+	// For sRGB this is equivalent to linearly interpolating the
+	// transferred white point value, but this property does not
+	// necessarily hold in other color spaces.
+	double linear_val = tf(val);
+
+	return (struct rgb) {
+		.r = inverse_tf(wp.r * linear_val),
+		.g = inverse_tf(wp.g * linear_val),
+		.b = inverse_tf(wp.b * linear_val)
+	};
+}

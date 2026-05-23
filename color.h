@@ -1,8 +1,8 @@
 #ifndef _COLOR_MATH_H
 #define _COLOR_MATH_H
 
-#include "math.h"
 #include "time.h"
+#include <stdint.h>
 
 // These are macros so they can be applied to constants
 #define DEGREES(rad) ((rad) * 180.0 / M_PI)
@@ -32,6 +32,8 @@ struct xyz {
 
 enum sun_condition calc_sun(struct tm *tm, double latitude,
 	double elevation_twilight, double elevation_daylight, struct sun *sun);
-struct rgb calc_whitepoint(int temp);
-
+struct xyz calc_whitepoint_xyz(int temp);
+struct rgb calc_whitepoint_linear(struct xyz wp, uint32_t primaries);
+struct rgb calc_gamma_value(struct rgb linear_wp, double val, 
+	uint32_t transfer_function);
 #endif
